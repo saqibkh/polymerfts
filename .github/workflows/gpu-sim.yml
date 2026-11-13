@@ -1,0 +1,111 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the CUDA backend and runs the CUDA tests on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, devel ]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "environment.yml"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  OMP_STACKSIZE: 1G
+  OMP_NUM_THREADS: 1
+  OPENBLAS_NUM_THREADS: 1
+
+jobs:
+  cuda:
+    name: CUDA 13.0 on simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+
+    # library-path false: the build links the toolkit's cuFFT, and the tests run
+    # under `vgpu run`, which supplies the simulator's libraries
+    - name: Set up the simulated GPU and CUDA toolkit
+      uses: pantheongpu/setup-pantheonsim@68edfd58c091361dd6baf060b63de412e544d858 # v0.1.7
+      with:
+        gpu: nvidia/h100
+        cuda-toolkit: "13.0"
+        library-path: 'false'
+
+    - name: Cache conda packages
+      uses: actions/cache@v6
+      with:
+        path: /home/runner/conda_pkgs_dir
+        key: conda-forge-${{ runner.os }}-${{ hashFiles('environment.yml') }}
+
+    - name: Install the conda environment
+      uses: conda-incubator/setup-miniconda@v4
+      with:
+        miniforge-version: latest
+        activate-environment: polymerfts
+        auto-activate: false
+        environment-file: environment.yml
+        channels: conda-forge
+        channel-priority: strict
+        conda-remove-defaults: "true"
+        pkgs-dirs: /home/runner/conda_pkgs_dir
+
+    # FFTW is the CPU reference of TestCrysFFT*, TestCudaDCT and TestCudaDST
+    - name: Install FFTW
+      run: |
+        conda install -y --override-channels -c conda-forge --freeze-installed fftw=3.3.11
+
+    # 90-virtual embeds compute_90 PTX only, which the simulator runs. The
+    # simulator needs the shared CUDA runtime (CMake's default is static).
+    # CUDA_FLAGS:
+    # - "-include algorithm": TestCrysFFTObliqueZCuda.cu uses std::max({...})
+    #   without <algorithm> (#2); drop it once #2 is merged.
+    # - "-static-global-template-stub=false": since CUDA 13, nvcc gives kernel
+    #   template instantiations internal stubs by default, so TestCudaTridiagonal
+    #   cannot link tridiagonal_lines_shared<>, which CudaSolverCNADI.cu instantiates.
+    - name: Configure
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+          -DPOLYMERFTS_USE_CUDA=ON \
+          -DPOLYMERFTS_CUDA_ARCHITECTURES=90-virtual \
+          -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+          -DPOLYMERFTS_USE_FFTW=ON \
+          -DPOLYMERFTS_USE_MKL=OFF \
+          -DPOLYMERFTS_BUILD_TESTS=ON \
+          -DCMAKE_CUDA_FLAGS="-include algorithm -static-global-template-stub=false"
+
+    - name: Build
+      run: cmake --build build -j3
+
+    # The TestCuda*, TestCrysFFT* and TestStressDiscreteCuda1D entries
+    - name: Run the CUDA tests
+      run: |
+        ulimit -s unlimited
+        export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+        vgpu run --gpu nvidia/h100 ctest --test-dir build -R 'Cuda|CrysFFT' \
+          --output-on-failure --no-tests=error --timeout 900
